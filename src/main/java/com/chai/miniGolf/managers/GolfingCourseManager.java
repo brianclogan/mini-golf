@@ -149,7 +149,7 @@ public class GolfingCourseManager implements Listener {
 
     @EventHandler
     private void onGolfballSpawn(EntitySpawnEvent event) {
-        if (event.getEntity() instanceof Snowball ball) {
+        if (event.getEntity() instanceof Snowball ball && ball.getPersistentDataContainer().has(getPlugin().ownerNameKey)) {
             String owner = ball.getPersistentDataContainer().get(getPlugin().ownerNameKey, STRING);
             for (Map.Entry<UUID, GolfingInfo> entry : golfers.entrySet()) {
                 Player otherGolfer = Bukkit.getPlayer(entry.getKey());
