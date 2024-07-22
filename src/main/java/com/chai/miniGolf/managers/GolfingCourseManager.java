@@ -6,18 +6,24 @@ import com.chai.miniGolf.events.HoleCompletedEvent;
 import com.chai.miniGolf.events.NextHoleRequestedEvent;
 import com.chai.miniGolf.events.PlayerDoneGolfingEvent;
 import com.chai.miniGolf.models.Course;
+import com.chai.miniGolf.models.Teleporters;
 import com.chai.miniGolf.utils.ShortUtils.ShortUtils;
 import lombok.Builder;
 import lombok.Data;
+import lombok.Getter;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.title.Title;
 import org.bukkit.Bukkit;
 import org.bukkit.ChatColor;
 import org.bukkit.FireworkEffect;
 import org.bukkit.Location;
+import org.bukkit.Material;
 import org.bukkit.Sound;
 import org.bukkit.block.Block;
+import org.bukkit.block.BlockFace;
 import org.bukkit.block.data.Directional;
+import org.bukkit.block.data.Levelled;
+import org.bukkit.block.data.type.BubbleColumn;
 import org.bukkit.entity.Entity;
 import org.bukkit.entity.EntityType;
 import org.bukkit.entity.Firework;
@@ -40,8 +46,12 @@ import org.bukkit.scheduler.BukkitRunnable;
 import org.bukkit.scheduler.BukkitTask;
 import org.bukkit.util.Vector;
 
+import javax.annotation.Nullable;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
@@ -51,6 +61,10 @@ import static com.chai.miniGolf.Main.getPlugin;
 import static com.chai.miniGolf.managers.ScorecardManager.holeResultColor;
 import static com.chai.miniGolf.managers.ScorecardManager.holeResultString;
 import static com.chai.miniGolf.utils.SharedMethods.isBottomSlab;
+import static org.bukkit.block.BlockFace.EAST;
+import static org.bukkit.block.BlockFace.NORTH;
+import static org.bukkit.block.BlockFace.SOUTH;
+import static org.bukkit.block.BlockFace.WEST;
 import static org.bukkit.persistence.PersistentDataType.DOUBLE;
 import static org.bukkit.persistence.PersistentDataType.INTEGER;
 import static org.bukkit.persistence.PersistentDataType.STRING;
@@ -263,7 +277,7 @@ public class GolfingCourseManager implements Listener {
             .findFirst();
     }
 
-    private Optional<UUID> getPUuidFromGolfball(Snowball ball) {
+    public Optional<UUID> getPUuidFromGolfball(Snowball ball) {
         return golfers.entrySet().stream()
             .filter(e -> ball.equals(e.getValue().getGolfball()))
             .map(Map.Entry::getKey)
@@ -294,6 +308,7 @@ public class GolfingCourseManager implements Listener {
             return false;
         }
         Location loc = ball.getLocation();
+        Block ballBlock = loc.getBlock();
         Block block = loc.subtract(0, 0.1, 0).getBlock();
         Vector vel = ball.getVelocity();
         switch (block.getType()) {
@@ -304,6 +319,9 @@ public class GolfingCourseManager implements Listener {
                 break;
             case AIR:
                 ball.setGravity(true);
+                if (Integer.valueOf(1).equals(ball.getPersistentDataContainer().get(getPlugin().bubbleColumnKey, INTEGER))) {
+                    ball.getPersistentDataContainer().set(getPlugin().bubbleColumnKey, INTEGER, 2);
+                }
                 break;
             case SLIME_BLOCK:
                 vel.setY(0.25);
@@ -324,12 +342,30 @@ public class GolfingCourseManager implements Listener {
                 handleGlazedTerracotta(ball, block, vel);
                 break;
             case WATER:
-                returnBallToLastLoc(ball);
+                if (block.getBlockData() instanceof Levelled levelled && levelled.getLevel() == 0 && !(block.getBlockData() instanceof BubbleColumn)) {
+                    returnBallToLastLoc(ball);
+                }
+                break;
+            case BUBBLE_COLUMN:
+                ball.getPersistentDataContainer().set(getPlugin().bubbleColumnKey, INTEGER, 1);
+                break;
+            case OBSIDIAN:
+                handleTeleporters(golfer, ball, block, vel);
                 break;
             default:
+                // It's possible that the player hit the ball into the cauldron so gotta check that.
+                if (ballBlock.getType().equals(Material.CAULDRON) && ballBlock.equals(golfer.getValue().getCourse().getCurrentHoleCauldronBlock(golfer.getKey()))) {
+                    holeCompleted(ball, golfer);
+                    return false;
+                }
+
+                // Need to know if we're in a bubbleColumn for exiting the bubbleColumn purposes
+                if (ballBlock.getBlockData() instanceof BubbleColumn) {
+                    ball.getPersistentDataContainer().set(getPlugin().bubbleColumnKey, INTEGER, 1);
+                }
+
                 // Check if floating above slabs
-                if (isBottomSlab(block) && loc.getY() > block.getY() + 0.5)
-                {
+                if (isBottomSlab(block) && loc.getY() > block.getY() + 0.5) {
                     ball.setGravity(true);
                 }
 
@@ -341,7 +377,77 @@ public class GolfingCourseManager implements Listener {
                 ball.setVelocity(vel);
                 break;
         }
+        if (Integer.valueOf(2).equals(ball.getPersistentDataContainer().get(getPlugin().bubbleColumnKey, INTEGER)) && vel.getY() < 0) {
+            handleExitingOfBubbleColumn(ball);
+            ball.getPersistentDataContainer().set(getPlugin().bubbleColumnKey, INTEGER, 0);
+        }
         return true;
+    }
+
+    private void handleTeleporters(Map.Entry<UUID, GolfingInfo> golfer, Snowball ball, Block block, Vector vel) {
+        int hole = golfer.getValue().getCourse().playersCurrentHole(golfer.getKey());
+        List<Teleporters> teleporters = golfer.getValue().getCourse().getHoles().get(hole).getTeleporters();
+        Optional<Teleporters> teleporter = teleporters.stream().filter(t -> t.getStartingLocX() == block.getX() && t.getStartingLocY() == block.getY() && t.getStartingLocZ() == block.getZ()).findFirst();
+        if (teleporter.isEmpty()) {
+            return;
+        }
+        BlockFace faceEntered = getFaceEntered(ball);
+        Vector newVel = Teleporters.velocityAfterTeleport(vel, faceEntered, teleporter.get());
+        BlockFace destinationFace = Teleporters.getConfiguredDestinationDirection(faceEntered, teleporter.get());
+        Vector ballOffsetForDestinationFace = Teleporters.getOffsetForDestinationFace(destinationFace, 1 + ball.getY() - ((int)ball.getY()));
+        Location newLoc = teleporter.get().getDestinationBlock(ball.getWorld()).getRelative(destinationFace).getLocation().add(ballOffsetForDestinationFace);
+        ball.teleport(newLoc);
+        ball.setVelocity(newVel);
+    }
+
+    private BlockFace getFaceEntered(Snowball ball) {
+        Vector vel = ball.getVelocity();
+        double positiveXVel = vel.getX();
+        double negativeXVel = -vel.getX();
+        double positiveZVel = vel.getZ();
+        double negativeZVel = -vel.getZ();
+        if (positiveXVel > negativeXVel && positiveXVel > positiveZVel && positiveXVel > negativeZVel) {
+            return WEST;
+        } else if (negativeXVel > positiveZVel && negativeXVel > negativeZVel) {
+            return EAST;
+        } else if (positiveZVel > negativeZVel) {
+            return NORTH;
+        } else {
+            return SOUTH;
+        }
+    }
+
+    private void handleExitingOfBubbleColumn(Snowball ball) {
+        Block ballBlock = ball.getLocation().getBlock();
+        List<BubbleColumnExitBlock> potentialExitBlocks = new ArrayList<>();
+        for (int x = -1; x <= 1; x++) {
+            for (int z = -1; z <= 1; z++) {
+                BubbleColumnExitBlock exitBlock = getValidExitBlockOrNull(ballBlock.getRelative(x, 0, z));
+                if (exitBlock != null) {
+                    potentialExitBlocks.add(exitBlock);
+                }
+            }
+        }
+        potentialExitBlocks.stream()
+            .min(Comparator.comparingInt(BubbleColumnExitBlock::getDistanceToGround))
+            .ifPresent(eb -> ball.teleport(eb.getExitBlock().getLocation().add(0.5, ball.getY() - ((int)ball.getY()), 0.5)));
+    }
+
+    @Nullable
+    private BubbleColumnExitBlock getValidExitBlockOrNull(Block block) {
+        int distanceToGround = 0;
+        Block originalBlock = block;
+        Material blockType = block.getType();
+        while (blockType == Material.AIR) {
+            distanceToGround++;
+            block = block.getRelative(0, -1, 0);
+            blockType = block.getType();
+        }
+        // If the "ground" is water or the exit block was never AIR to begin with, it's not valid
+        if (blockType == Material.WATER || blockType.equals(Material.BUBBLE_COLUMN) || block.equals(originalBlock)) {
+            return null;
+        }
+        return BubbleColumnExitBlock.builder().exitBlock(originalBlock).distanceToGround(distanceToGround).build();
     }
 
     private boolean handleCauldronAndDecideIfSuccessfullyCompletedHole(Snowball ball, Vector vel, Block cauldron, Map.Entry<UUID, GolfingInfo> golfer) {
@@ -349,7 +455,11 @@ public class GolfingCourseManager implements Listener {
         if ((vel.getY() >= 0 && vel.length() > 0.34) || !cauldron.equals(golfer.getValue().getCourse().getCurrentHoleCauldronBlock(golfer.getKey()))) {
             return false;
         }
+        holeCompleted(ball, golfer);
+        return true;
+    }
 
+    private static void holeCompleted(Snowball ball, Map.Entry<UUID, GolfingInfo> golfer) {
         Course course = golfer.getValue().getCourse();
 
         // Send message
@@ -376,7 +486,6 @@ public class GolfingCourseManager implements Listener {
                 ball.getPersistentDataContainer().get(getPlugin().strokesKey, INTEGER)
             )
         );
-        return true;
     }
 
     private void handleGlazedTerracotta(Snowball ball, Block block, Vector vel) {
@@ -384,21 +493,21 @@ public class GolfingCourseManager implements Listener {
         Vector newVel;
         switch (directional.getFacing()) {
             case NORTH:
-                newVel = new Vector(0, 0, 0.1);
+                newVel = new Vector(vel.getX(), vel.getY(), vel.getZ() + getPlugin().config().getMagentaGlazedTerracottaAcceleration());
                 break;
             case SOUTH:
-                newVel = new Vector(0, 0, -0.1);
+                newVel = new Vector(vel.getX(), vel.getY(), -vel.getZ() + getPlugin().config().getMagentaGlazedTerracottaAcceleration());
                 break;
             case EAST:
-                newVel = new Vector(-0.1, 0, 0);
+                newVel = new Vector(-vel.getX() + getPlugin().config().getMagentaGlazedTerracottaAcceleration(), vel.getY(), vel.getZ());
                 break;
             case WEST:
-                newVel = new Vector(0.1, 0, 0);
+                newVel = new Vector(vel.getZ() + getPlugin().config().getMagentaGlazedTerracottaAcceleration(), vel.getY(), vel.getZ());
                 break;
             default:
                 return;
         }
-        ball.setVelocity(vel.multiply(9.0).add(newVel).multiply(0.1));
+        ball.setVelocity(newVel);
     }
 
     private void cleanUpAnyUnusedBalls(Player golfer) {
@@ -426,5 +535,12 @@ public class GolfingCourseManager implements Listener {
             }
             golfball = ball;
         }
+    }
+
+    @Getter
+    @Builder
+    public static class BubbleColumnExitBlock {
+        private final Block exitBlock;
+        private final int distanceToGround;
     }
 }
