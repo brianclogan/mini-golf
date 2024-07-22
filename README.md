@@ -1,6 +1,16 @@
 # mini-golf
 Play mini golf in Minecraft!
 
+## How to Download:
+
+Click on the jar file:
+
+![img.png](pictures/click-on-the-jar-file.png)
+
+Click the download button:
+
+![img.png](pictures/click-download.png)
+
 ## Commands
 
 #### /mgcreatecourse <course_name>
