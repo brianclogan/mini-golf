@@ -1,4 +1,4 @@
-# mini-golf
+# Mini-Golf
 Play mini golf in Minecraft!
 
 ## How to Download:
